@@ -10,7 +10,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
 
 BASE = Path(__file__).parent
-DATA = BASE / 'data'
+DATA = BASE
 
 def load_data():
     clients = pd.read_csv(DATA / 'clients.csv')
