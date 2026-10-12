@@ -1,260 +1,284 @@
 
-import streamlit as st
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
-import plotly.express as px
 
-from analysis import load_data, cluster_data
-
-st.set_page_config(
-    page_title="Real Estate Buyer Intelligence",
-    page_icon="🏙️",
-    layout="wide",
-)
-
-st.title("🏙️ Real Estate Buyer Segmentation & Investment Profiling")
-st.caption("Machine-learning buyer intelligence dashboard | Unified Mentor Project")
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.metrics import silhouette_score
 
 
-@st.cache_data
-def get_results():
-    clients, properties, data = load_data()
-    clustered, metrics = cluster_data(data)
-    return clients, properties, clustered, metrics
+BASE = Path(__file__).resolve().parent
 
 
-try:
-    clients, properties, data, metrics = get_results()
-except Exception as e:
-    st.error("Project data load nahi ho paaya.")
-    st.exception(e)
-    st.stop()
+def find_csv(filename):
+    paths = [
+        BASE / filename,
+        BASE / "data" / filename,
+    ]
 
+    for path in paths:
+        if path.exists():
+            return path
 
-# Ensure every dashboard column exists
-required_defaults = {
-    "client_id": "",
-    "client_type": "Unknown",
-    "country": "Unknown",
-    "region": "Unknown",
-    "acquisition_purpose": "Unknown",
-    "loan_applied": "Unknown",
-    "satisfaction_score": 0,
-    "age": 0,
-    "sold_properties": 0,
-    "avg_purchase_price": 0,
-    "total_purchase_value": 0,
-    "cluster": 0,
-}
+    matches = list(BASE.glob(Path(filename).stem + "*.csv"))
+    if matches:
+        return matches[0]
 
-for col, default in required_defaults.items():
-    if col not in data.columns:
-        data[col] = default
-
-for col in ["sold_properties", "avg_purchase_price",
-            "total_purchase_value", "satisfaction_score", "age"]:
-    data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
-
-for col in ["country", "region", "acquisition_purpose",
-            "client_type", "loan_applied"]:
-    data[col] = data[col].fillna("Unknown").astype(str)
-
-
-# Sidebar filters
-st.sidebar.header("Filter buyers")
-
-
-def choices(col):
-    return sorted(data[col].dropna().astype(str).unique().tolist())
-
-
-country = st.sidebar.multiselect("Country", choices("country"))
-region = st.sidebar.multiselect("Region", choices("region"))
-purpose = st.sidebar.multiselect("Acquisition purpose", choices("acquisition_purpose"))
-ctype = st.sidebar.multiselect("Client type", choices("client_type"))
-
-filtered = data.copy()
-
-for col, vals in [
-    ("country", country),
-    ("region", region),
-    ("acquisition_purpose", purpose),
-    ("client_type", ctype),
-]:
-    if vals:
-        filtered = filtered[filtered[col].astype(str).isin(vals)]
-
-
-# KPI cards
-st.subheader("Key Performance Indicators")
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Clients in View", f"{len(filtered):,}")
-
-investment_count = (
-    filtered["acquisition_purpose"].str.lower() == "investment"
-).sum()
-c2.metric("Investment Buyers", f"{investment_count:,}")
-
-loan_count = (
-    filtered["loan_applied"].str.lower().isin(["yes", "true", "1"])
-).sum()
-c3.metric("Loan Applicants", f"{loan_count:,}")
-
-c4.metric("Sold Properties", f"{int(filtered['sold_properties'].sum()):,}")
-
-
-# Segmentation charts
-st.subheader("Buyer Segmentation Overview")
-
-left, right = st.columns(2)
-
-with left:
-    counts = (
-        filtered["cluster"].value_counts().sort_index()
-        .rename_axis("Cluster")
-        .reset_index(name="Buyers")
+    raise FileNotFoundError(
+        f"{filename} nahi mili. CSV ko repository ke main folder mein upload karo."
     )
-    counts["Cluster"] = counts["Cluster"].map(lambda x: f"C{int(x) + 1}")
-    fig = px.bar(
-        counts, x="Cluster", y="Buyers",
-        title="Buyer Count by Cluster", text="Buyers"
+
+
+def load_data():
+    clients = pd.read_csv(find_csv("clients.csv"))
+    properties = pd.read_csv(find_csv("properties.csv"))
+
+    clients.columns = clients.columns.str.strip().str.lower()
+    properties.columns = properties.columns.str.strip().str.lower()
+
+    if "client_id" not in clients.columns:
+        raise ValueError("clients.csv mein client_id column missing hai.")
+
+    if "client_ref" not in properties.columns:
+        raise ValueError("properties.csv mein client_ref column missing hai.")
+
+    clients["client_id"] = clients["client_id"].astype("string").str.strip()
+    properties["client_ref"] = (
+        properties["client_ref"].astype("string").str.strip()
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-with right:
-    purpose_counts = (
-        filtered.groupby(["cluster", "acquisition_purpose"])
-        .size().reset_index(name="Buyers")
-    )
-    purpose_counts["Cluster"] = purpose_counts["cluster"].map(
-        lambda x: f"C{int(x) + 1}"
-    )
-    fig = px.bar(
-        purpose_counts, x="Cluster", y="Buyers",
-        color="acquisition_purpose", barmode="group",
-        title="Acquisition Purpose by Cluster"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# Purchase profile
-st.subheader("Investor Behaviour")
-
-left, right = st.columns(2)
-
-with left:
-    price_profile = (
-        filtered.groupby("cluster", as_index=False)
-        .agg(
-            avg_purchase_value=("avg_purchase_price", "mean"),
-            total_purchase_value=("total_purchase_value", "sum"),
+    # Calculate age from date of birth
+    if "date_of_birth" in clients.columns:
+        dob = pd.to_datetime(
+            clients["date_of_birth"],
+            errors="coerce",
+            dayfirst=True,
         )
+        today = pd.Timestamp.today().normalize()
+
+        age = today.year - dob.dt.year
+        birthday_not_reached = (
+            (today.month < dob.dt.month)
+            | (
+                (today.month == dob.dt.month)
+                & (today.day < dob.dt.day)
+            )
+        )
+        clients["age"] = (age - birthday_not_reached.astype(float)).where(
+            dob.notna()
+        )
+
+    # Convert property prices into numbers
+    if "sale_price" in properties.columns:
+        properties["sale_price"] = pd.to_numeric(
+            properties["sale_price"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.strip(),
+            errors="coerce",
+        )
+    else:
+        properties["sale_price"] = np.nan
+
+    # Identify sold property records
+    if "listing_status" in properties.columns:
+        sold_mask = (
+            properties["listing_status"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .eq("sold")
+        )
+    else:
+        sold_mask = pd.Series(False, index=properties.index)
+
+    sold = properties.loc[
+        sold_mask & properties["client_ref"].notna()
+    ].copy()
+
+    # Summarise transactions for each client
+    if len(sold) > 0:
+        summary = (
+            sold.groupby("client_ref")
+            .agg(
+                sold_properties=("client_ref", "size"),
+                avg_purchase_price=("sale_price", "mean"),
+                total_purchase_value=("sale_price", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"client_ref": "client_id"})
+        )
+    else:
+        summary = pd.DataFrame(
+            columns=[
+                "client_id",
+                "sold_properties",
+                "avg_purchase_price",
+                "total_purchase_value",
+            ]
+        )
+
+    # Match properties to clients using client_ref = client_id
+    data = clients.merge(summary, on="client_id", how="left")
+
+    data["sold_properties"] = (
+        data["sold_properties"].fillna(0).astype(int)
     )
-    price_profile["Cluster"] = price_profile["cluster"].map(
-        lambda x: f"C{int(x) + 1}"
+    data["avg_purchase_price"] = (
+        data["avg_purchase_price"].fillna(0)
     )
-    fig = px.bar(
-        price_profile, x="Cluster", y="avg_purchase_value",
-        title="Average Purchase Value by Cluster",
-        labels={"avg_purchase_value": "Average Purchase Value"}
+    data["total_purchase_value"] = (
+        data["total_purchase_value"].fillna(0)
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-with right:
-    fig = px.histogram(
-        filtered, x="satisfaction_score",
-        color="acquisition_purpose", nbins=5,
-        title="Satisfaction Score Distribution"
+    # Ensure columns needed by the dashboard exist
+    defaults = {
+        "client_type": "Unknown",
+        "country": "Unknown",
+        "region": "Unknown",
+        "acquisition_purpose": "Unknown",
+        "loan_applied": "Unknown",
+        "satisfaction_score": np.nan,
+        "age": np.nan,
+    }
+
+    for column, default in defaults.items():
+        if column not in data.columns:
+            data[column] = default
+
+    data["satisfaction_score"] = pd.to_numeric(
+        data["satisfaction_score"], errors="coerce"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    data["age"] = pd.to_numeric(data["age"], errors="coerce")
+
+    return clients, properties, data
 
 
-# Geographic analysis
-st.subheader("Geographic Buyer Analysis")
+def cluster_data(data):
+    df = data.copy()
 
-geo = (
-    filtered.groupby(["country", "region"], as_index=False)
-    .agg(
-        buyers=("client_id", "nunique"),
-        investment_buyers=(
-            "acquisition_purpose",
-            lambda s: (s.astype(str).str.lower() == "investment").sum()
-        ),
+    numeric_features = [
+        "age",
+        "satisfaction_score",
+        "sold_properties",
+        "avg_purchase_price",
+        "total_purchase_value",
+    ]
+
+    categorical_features = [
+        "client_type",
+        "country",
+        "region",
+        "acquisition_purpose",
+        "loan_applied",
+    ]
+
+    # Ensure modelling columns are present
+    for column in numeric_features:
+        if column not in df.columns:
+            df[column] = np.nan
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    for column in categorical_features:
+        if column not in df.columns:
+            df[column] = "Unknown"
+        df[column] = df[column].fillna("Unknown").astype(str)
+
+    # Avoid all-missing numeric columns
+    for column in numeric_features:
+        if df[column].isna().all():
+            df[column] = 0
+
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    preprocessor = ColumnTransformer([
+        ("numeric", numeric_pipeline, numeric_features),
+        ("categorical", categorical_pipeline, categorical_features),
+    ])
+
+    n = len(df)
+
+    if n == 0:
+        df["cluster"] = pd.Series(dtype=int)
+        return df, {
+            "kmeans_silhouette_sample": 0.0,
+            "hierarchical_silhouette_sample": 0.0,
+            "n_clusters": 0,
+            "samples": 0,
+        }
+
+    if n < 3:
+        df["cluster"] = 0
+        return df, {
+            "kmeans_silhouette_sample": 0.0,
+            "hierarchical_silhouette_sample": 0.0,
+            "n_clusters": 1,
+            "samples": n,
+        }
+
+    X = preprocessor.fit_transform(df)
+
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+
+    # Use fewer clusters for small datasets
+    n_clusters = min(4, n - 1)
+
+    model = KMeans(
+        n_clusters=n_clusters,
+        random_state=42,
+        n_init=10,
     )
-    .sort_values("buyers", ascending=False)
-    .head(20)
-)
+    df["cluster"] = model.fit_predict(X)
 
-if not geo.empty:
-    fig = px.bar(
-        geo, x="region", y="buyers", color="country",
-        title="Top Regions by Buyer Count",
-        hover_data=["investment_buyers"]
-    )
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("Selected filters ke liye geographic data available nahi hai.")
+    # Calculate silhouette scores on at most 500 records
+    rng = np.random.RandomState(42)
+    sample_size = min(500, n)
+    indices = rng.choice(n, size=sample_size, replace=False)
+    X_sample = X[indices]
 
+    def calculate_silhouette(features, labels):
+        unique_labels = np.unique(labels)
+        if len(unique_labels) < 2 or len(unique_labels) >= len(labels):
+            return 0.0
+        try:
+            return float(silhouette_score(features, labels))
+        except Exception:
+            return 0.0
 
-# Cluster profiles
-st.subheader("Cluster Insights")
+    km_labels = df["cluster"].to_numpy()[indices]
+    kmeans_score = calculate_silhouette(X_sample, km_labels)
 
-profile = (
-    filtered.groupby("cluster")
-    .agg(
-        Buyers=("client_id", "nunique"),
-        Mean_Age=("age", "mean"),
-        Mean_Satisfaction=("satisfaction_score", "mean"),
-        Investment_Buyers=(
-            "acquisition_purpose",
-            lambda s: (s.astype(str).str.lower() == "investment").sum()
-        ),
-        Loan_Applicants=(
-            "loan_applied",
-            lambda s: s.astype(str).str.lower().isin(["yes", "true", "1"]).sum()
-        ),
-        Properties_Sold=("sold_properties", "sum"),
-        Avg_Purchase_Value=("avg_purchase_price", "mean"),
-    )
-    .reset_index()
-)
+    try:
+        hierarchical_labels = AgglomerativeClustering(
+            n_clusters=n_clusters
+        ).fit_predict(X_sample)
 
-profile["Cluster"] = profile["cluster"].map(lambda x: f"C{int(x) + 1}")
+        hierarchical_score = calculate_silhouette(
+            X_sample, hierarchical_labels
+        )
+    except Exception:
+        hierarchical_score = 0.0
 
-st.dataframe(
-    profile.drop(columns="cluster").round(2),
-    use_container_width=True,
-    hide_index=True,
-)
+    metrics = {
+        "kmeans_silhouette_sample": kmeans_score,
+        "hierarchical_silhouette_sample": hierarchical_score,
+        "n_clusters": n_clusters,
+        "samples": n,
+    }
 
-k_score = metrics.get("kmeans_silhouette_sample", 0.0)
-h_score = metrics.get("hierarchical_silhouette_sample", 0.0)
-
-st.caption(
-    f"Clustering diagnostics — K-Means silhouette: {k_score:.3f}; "
-    f"Hierarchical silhouette: {h_score:.3f}. "
-    "These scores are diagnostics and do not prove commercial optimality."
-)
-
-
-# Client records
-st.subheader("Filtered Client Records")
-
-display_cols = [
-    "client_id", "client_type", "country", "region",
-    "acquisition_purpose", "loan_applied", "satisfaction_score",
-    "sold_properties", "total_purchase_value", "cluster"
-]
-
-records = filtered[display_cols].copy()
-records["cluster"] = records["cluster"].map(lambda x: f"C{int(x) + 1}")
-
-st.dataframe(records, use_container_width=True, hide_index=True)
-
-st.download_button(
-    "Download Filtered Buyer Data (CSV)",
-    data=filtered.to_csv(index=False).encode("utf-8"),
-    file_name="filtered_buyer_segments.csv",
-    mime="text/csv",
-)
+    return df, metrics
