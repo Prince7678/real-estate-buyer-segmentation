@@ -1,245 +1,257 @@
 
 from pathlib import Path
-import pandas as pd
-import numpy as np
 
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.metrics import silhouette_score
-from sklearn.decomposition import PCA
 
 
-# Project folder: CSV files are expected beside analysis.py
 BASE = Path(__file__).resolve().parent
-DATA = BASE
 
 
 def find_csv(filename):
-    """Find a dataset in the project root or data folder."""
     candidates = [
         BASE / filename,
         BASE / "data" / filename,
     ]
 
     for path in candidates:
-        if path.is_file():
+        if path.exists():
             return path
 
-    # Handle accidentally duplicated download names, e.g. properties (1).csv
-    stem = Path(filename).stem
-    matches = sorted(BASE.glob(f"{stem}*.csv"))
-
+    matches = list(BASE.glob(Path(filename).stem + "*.csv"))
     if matches:
         return matches[0]
 
     raise FileNotFoundError(
-        f"{filename} was not found. "
-        f"Place it in the repository root or data/ folder."
-    )
-
-
-def clean_numeric(series):
-    """Convert currency and comma-formatted values to numbers."""
-    return pd.to_numeric(
-        series.astype(str)
-        .str.replace(r"[$₹,\s]", "", regex=True)
-        .replace({"nan": np.nan, "None": np.nan, "": np.nan}),
-        errors="coerce",
+        f"{filename} not found. Upload it to the repository root."
     )
 
 
 def load_data():
-    """Load and prepare client and property transaction datasets."""
     clients = pd.read_csv(find_csv("clients.csv"))
     properties = pd.read_csv(find_csv("properties.csv"))
 
-    # Normalize column names.
     clients.columns = clients.columns.str.strip().str.lower()
     properties.columns = properties.columns.str.strip().str.lower()
 
-    # Prepare client information.
+    if "client_id" not in clients.columns:
+        raise ValueError("clients.csv must contain client_id")
+
+    if "client_ref" not in properties.columns:
+        raise ValueError("properties.csv must contain client_ref")
+
+    clients["client_id"] = clients["client_id"].astype("string").str.strip()
+    properties["client_ref"] = (
+        properties["client_ref"].astype("string").str.strip()
+    )
+
+    # Calculate client age
     if "date_of_birth" in clients.columns:
-        clients["date_of_birth"] = pd.to_datetime(
-            clients["date_of_birth"],
-            errors="coerce",
-            dayfirst=True,
+        dob = pd.to_datetime(
+            clients["date_of_birth"], errors="coerce", dayfirst=True
         )
-        reference_date = pd.Timestamp.today().normalize()
+        today = pd.Timestamp.today().normalize()
         clients["age"] = (
-            (reference_date - clients["date_of_birth"]).dt.days / 365.25
-        ).round()
-
-        clients.loc[
-            ~clients["age"].between(18, 100), "age"
-        ] = np.nan
-
-    # Prepare property information.
-    if "transaction_date" in properties.columns:
-        properties["transaction_date"] = pd.to_datetime(
-            properties["transaction_date"],
-            errors="coerce",
-            dayfirst=True,
+            today.year
+            - dob.dt.year
+            - (
+                (today.month < dob.dt.month)
+                | (
+                    (today.month == dob.dt.month)
+                    & (today.day < dob.dt.day)
+                )
+            ).astype("Int64")
         )
+        clients["age"] = pd.to_numeric(clients["age"], errors="coerce")
 
+    # Prepare property transaction fields
     if "sale_price" in properties.columns:
-        properties["sale_price"] = clean_numeric(
+        properties["sale_price"] = pd.to_numeric(
             properties["sale_price"]
-        )
-
-    if "floor_area_sqft" in properties.columns:
-        properties["floor_area_sqft"] = clean_numeric(
-            properties["floor_area_sqft"]
-        )
-
-    # Normalize transaction status.
-    if "listing_status" in properties.columns:
-        properties["listing_status"] = (
-            properties["listing_status"].astype(str).str.strip().str.title()
-        )
-
-    # Join property transactions to the corresponding clients.
-    if "client_ref" in properties.columns and "client_ref" in clients.columns:
-        data = properties.merge(
-            clients,
-            on="client_ref",
-            how="left",
-            suffixes=("_property", "_client"),
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.strip(),
+            errors="coerce",
         )
     else:
-        # Keep the property data usable even when no common key exists.
-        data = properties.copy()
+        properties["sale_price"] = np.nan
 
-    if data.empty:
-        raise ValueError("The property dataset contains no records.")
+    if "listing_status" in properties.columns:
+        sold_mask = (
+            properties["listing_status"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .eq("sold")
+        )
+    else:
+        sold_mask = pd.Series(False, index=properties.index)
+
+    # Count and value sold properties for each client
+    sold = properties.loc[sold_mask].copy()
+
+    if sold.empty:
+        property_summary = pd.DataFrame(
+            columns=[
+                "client_id",
+                "sold_properties",
+                "avg_purchase_price",
+                "total_purchase_value",
+            ]
+        )
+    else:
+        property_summary = (
+            sold.groupby("client_ref", dropna=True)
+            .agg(
+                sold_properties=("client_ref", "size"),
+                avg_purchase_price=("sale_price", "mean"),
+                total_purchase_value=("sale_price", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"client_ref": "client_id"})
+        )
+
+    # Join client details with their sold-property summary
+    data = clients.merge(property_summary, on="client_id", how="left")
+
+    data["sold_properties"] = (
+        data["sold_properties"].fillna(0).astype(int)
+    )
+    data["avg_purchase_price"] = data["avg_purchase_price"].fillna(0)
+    data["total_purchase_value"] = data["total_purchase_value"].fillna(0)
+
+    # Add safe defaults for dashboard fields
+    defaults = {
+        "client_type": "Unknown",
+        "country": "Unknown",
+        "region": "Unknown",
+        "acquisition_purpose": "Unknown",
+        "loan_applied": "Unknown",
+        "satisfaction_score": np.nan,
+    }
+
+    for col, default in defaults.items():
+        if col not in data.columns:
+            data[col] = default
+
+    data["satisfaction_score"] = pd.to_numeric(
+        data["satisfaction_score"], errors="coerce"
+    )
 
     return clients, properties, data
 
 
 def cluster_data(data):
-    """Segment real-estate transactions using K-Means clustering."""
     df = data.copy()
 
-    numeric_candidates = [
-        "age",
-        "income",
-        "annual_income",
-        "monthly_income",
-        "budget",
-        "investment_budget",
-        "sale_price",
-        "floor_area_sqft",
-        "tower_number",
-    ]
-
-    categorical_candidates = [
-        "unit_category",
-        "listing_status",
-        "city",
-        "location",
-        "property_type",
-        "investment_type",
-    ]
-
     numeric_features = [
-        col for col in numeric_candidates
-        if col in df.columns
-        and pd.to_numeric(df[col], errors="coerce").notna().any()
+        "age",
+        "satisfaction_score",
+        "sold_properties",
+        "avg_purchase_price",
+        "total_purchase_value",
     ]
 
     categorical_features = [
-        col for col in categorical_candidates
-        if col in df.columns and df[col].nunique(dropna=True) > 1
+        "client_type",
+        "country",
+        "region",
+        "acquisition_purpose",
+        "loan_applied",
     ]
 
-    if not numeric_features and not categorical_features:
-        raise ValueError(
-            "No usable numeric or categorical features were found."
-        )
+    for col in numeric_features:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Use only selected features, not IDs or personal identifiers.
-    X = df[numeric_features + categorical_features].copy()
+    for col in categorical_features:
+        if col not in df.columns:
+            df[col] = "Unknown"
+        df[col] = df[col].fillna("Unknown").astype(str)
 
-    numeric_pipeline = Pipeline([
+    numeric_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
     ])
 
-    categorical_pipeline = Pipeline([
+    categorical_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("encoder", OneHotEncoder(handle_unknown="ignore")),
     ])
 
-    transformers = []
+    preprocessor = ColumnTransformer([
+        ("numeric", numeric_pipe, numeric_features),
+        ("categorical", categorical_pipe, categorical_features),
+    ])
 
-    if numeric_features:
-        transformers.append(
-            ("numeric", numeric_pipeline, numeric_features)
-        )
+    n = len(df)
 
-    if categorical_features:
-        transformers.append(
-            ("categorical", categorical_pipeline, categorical_features)
-        )
-
-    preprocessor = ColumnTransformer(transformers)
-    X_transformed = preprocessor.fit_transform(X)
-
-    if hasattr(X_transformed, "toarray"):
-        X_transformed = X_transformed.toarray()
-
-    n_samples = len(df)
-
-    if n_samples < 2:
+    if n < 2:
         df["cluster"] = 0
-        metrics = {
+        return df, {
+            "kmeans_silhouette_sample": 0.0,
+            "hierarchical_silhouette_sample": 0.0,
             "n_clusters": 1,
-            "silhouette_score": None,
-            "samples": n_samples,
-            "numeric_features": numeric_features,
-            "categorical_features": categorical_features,
+            "samples": n,
         }
-        return df, metrics
 
-    # Limit cluster count to what the available data supports.
-    n_clusters = min(4, n_samples - 1)
+    X = preprocessor.fit_transform(df)
 
-    model = KMeans(
+    if hasattr(X, "toarray"):
+        X_dense = X.toarray()
+    else:
+        X_dense = np.asarray(X)
+
+    n_clusters = min(4, n)
+
+    kmeans = KMeans(
         n_clusters=n_clusters,
         random_state=42,
         n_init=10,
     )
+    df["cluster"] = kmeans.fit_predict(X_dense)
 
-    labels = model.fit_predict(X_transformed)
-    df["cluster"] = labels
+    # Silhouette diagnostics on a manageable sample
+    rng = np.random.RandomState(42)
+    sample_size = min(500, n)
+    sample_indices = rng.choice(n, size=sample_size, replace=False)
+    X_sample = X_dense[sample_indices]
+    km_sample_labels = df["cluster"].to_numpy()[sample_indices]
 
-    score = None
-    if 1 < len(np.unique(labels)) < n_samples:
+    def safe_silhouette(features, labels):
+        if len(np.unique(labels)) < 2 or len(np.unique(labels)) >= len(labels):
+            return 0.0
         try:
-            score = float(
-                silhouette_score(X_transformed, labels)
-            )
-        except (ValueError, TypeError):
-            score = None
+            return float(silhouette_score(features, labels))
+        except Exception:
+            return 0.0
 
-    # Optional 2D PCA coordinates for dashboard visualizations.
+    kmeans_score = safe_silhouette(X_sample, km_sample_labels)
+
     try:
-        pca = PCA(n_components=2)
-        coords = pca.fit_transform(X_transformed)
-        df["pca_x"] = coords[:, 0]
-        df["pca_y"] = coords[:, 1]
-    except (ValueError, TypeError):
-        df["pca_x"] = np.nan
-        df["pca_y"] = np.nan
+        hierarchical_labels = AgglomerativeClustering(
+            n_clusters=n_clusters
+        ).fit_predict(X_sample)
+
+        hierarchical_score = safe_silhouette(
+            X_sample, hierarchical_labels
+        )
+    except Exception:
+        hierarchical_score = 0.0
 
     metrics = {
-        "n_clusters": int(len(np.unique(labels))),
-        "silhouette_score": score,
-        "samples": int(n_samples),
-        "numeric_features": numeric_features,
-        "categorical_features": categorical_features,
+        "kmeans_silhouette_sample": kmeans_score,
+        "hierarchical_silhouette_sample": hierarchical_score,
+        "n_clusters": n_clusters,
+        "samples": n,
     }
 
     return df, metrics
